@@ -2,6 +2,7 @@ import re
 from abc import ABC
 
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM
 
 from src.classifier_models.base import (
@@ -98,7 +99,7 @@ class WildGuardBase(SafetyClassifierBase, ABC):
         return inputs
 
 
-class WildGuard(WildGuardBase):
+class WildGuardVLLM(WildGuardBase):
     MODEL_NAME = "allenai/wildguard"
 
     def __init__(
@@ -137,6 +138,77 @@ class WildGuard(WildGuardBase):
                 top_p=1.0,
                 use_tqdm=True
             )
+        outputs = [self.parse_model_generation_to_output(output) for output in decoded_outputs]
+
+        return outputs
+
+class WildGuard(WildGuardBase):
+    MODEL_NAME = "allenai/wildguard"
+
+    def __init__(
+            self,
+            batch_size: int = -1,
+            ephemeral_model: bool = True,
+            **kwargs,
+    ):
+        super().__init__(batch_size, **kwargs)
+        self.input_format = WILDGUARD_INPUT_FORMAT
+        # Replace vLLM initialization with Hugging Face
+        print(f"Loading WildGuard via HF on {torch.cuda.current_device()}...")
+        
+        # CRITICAL: Decoder models must use left-padding for batch generation
+        self.tokenizer = AutoTokenizer.from_pretrained(self.MODEL_NAME, padding_side="left")
+        
+        # Ensure the tokenizer has a pad token (WildGuard/Mistral often needs this)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.MODEL_NAME,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+        self.model.eval()
+
+    @torch.inference_mode()
+    def _classify_batch(self, batch: list[dict[str, str]]) -> list[SafetyClassifierOutput]:
+        formatted_prompts = self.build_input_prompts(batch)
+
+        # Standard HF Inference Loop instead of vLLM
+        decoded_outputs = []
+        
+        # Process in sub-batches to avoid OOM
+        step = 4 
+        for i in range(0, len(formatted_prompts), step):
+            batch_texts = formatted_prompts[i:i+step]
+            
+            # 1. Tokenize with padding and attention mask
+            inputs = self.tokenizer(
+                batch_texts, 
+                return_tensors="pt", 
+                padding=True,
+                truncation=True,
+                max_length=1024 # Prevents OOM on runaway prompts
+            ).to(self.model.device)
+            
+            # 2. Generate
+            generate_ids = self.model.generate(
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask, # Required for padded batches
+                max_new_tokens=128,
+                temperature=0.0,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id
+            )
+            
+            # 3. Slice to get ONLY the newly generated tokens
+            # (HF generate returns [prompt + completion])
+            prompt_len = inputs.input_ids.shape[1]
+            new_tokens = generate_ids[:, prompt_len:]
+            
+            batch_outputs = self.tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
+            decoded_outputs.extend(batch_outputs)
+
         outputs = [self.parse_model_generation_to_output(output) for output in decoded_outputs]
 
         return outputs
